@@ -1,240 +1,406 @@
-import React, { useRef, useState, useEffect } from 'react';
-import { SketchPicker } from 'react-color';
-import './Canvas.css';
+import React, { useEffect, useRef, useState, useCallback } from "react";
+import { SketchPicker } from "react-color";
+import "./Canvas.css";
+
+
+import undoIcon from "./undo (1).png";     
+import redoIcon from "./redo-arrow.png";   
 
 const Canvas = () => {
   const canvasRef = useRef(null);
-  const contextRef = useRef(null);
+  const ctxRef = useRef(null);
 
   const [isDrawing, setIsDrawing] = useState(false);
-  const [tool, setTool] = useState('brush');
-  const [color, setColor] = useState('#000000');
+  const [tool, setTool] = useState("brush");
+  const [color, setColor] = useState("#000000"); // opak HEX
   const [brushSize, setBrushSize] = useState(5);
-  const [shape, setShape] = useState(null); // Track the selected shape
+
+  // Şekil modu: rectangle | circle | triangle | null
+  const [shape, setShape] = useState(null);
   const [fill, setFill] = useState(false);
+  const startRef = useRef({ x: 0, y: 0 });
 
-  const [startX, setStartX] = useState(null); // Starting X position
-  const [startY, setStartY] = useState(null); // Starting Y position
-  const [shapes, setShapes] = useState([]); // History of shapes and brush strokes
-  const [currentBrushStroke, setCurrentBrushStroke] = useState([]); // Track current brush stroke
+  // Geçmiş ve Redo yığını
+  const [items, setItems] = useState([]);         // [{type:'path'|'shape', ...}]
+  const [redoStack, setRedoStack] = useState([]); // ileri alma
+  const itemsRef = useRef(items);
+  const redoRef = useRef(redoStack);
+  useEffect(() => { itemsRef.current = items; }, [items]);
+  useEffect(() => { redoRef.current = redoStack; }, [redoStack]);
 
-  useEffect(() => {
+  // Anlık path
+  const [currentPath, setCurrentPath] = useState([]);
+  const currentPathRef = useRef(currentPath);
+  useEffect(() => { currentPathRef.current = currentPath; }, [currentPath]);
+
+  // Canvas kurulumu (DPR uyumlu)
+  const setupCanvas = useCallback(() => {
     const canvas = canvasRef.current;
-    canvas.width = window.innerWidth * 2;
-    canvas.height = window.innerHeight * 2;
-    canvas.style.width = `${window.innerWidth}px`;
-    canvas.style.height = `${window.innerHeight}px`;
+    const dpr = Math.max(window.devicePixelRatio || 1, 1);
+    const cssWidth = canvas.parentElement?.clientWidth || window.innerWidth;
+    const cssHeight = window.innerHeight;
 
-    const context = canvas.getContext('2d');
-    context.scale(2, 2);
-    context.lineCap = 'round';
-    contextRef.current = context;
+    canvas.width = Math.floor(cssWidth * dpr);
+    canvas.height = Math.floor(cssHeight * dpr);
+    canvas.style.width = `${cssWidth}px`;
+    canvas.style.height = `${cssHeight}px`;
+
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.scale(dpr, dpr);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctxRef.current = ctx;
   }, []);
 
   useEffect(() => {
-    const context = contextRef.current;
+    setupCanvas();
+    redrawAll([]);
 
-    if (tool === 'eraser') {
-      // Switch to eraser mode
-      context.globalCompositeOperation = 'destination-out';
-    } else {
-      // Switch to drawing mode
-      context.globalCompositeOperation = 'source-over';
-      context.strokeStyle = color; // Set brush color
-    }
+    const onResize = () => {
+      setupCanvas();
+      redrawAll(itemsRef.current);
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setupCanvas]);
 
-    context.lineWidth = brushSize;
+  // Anlık araç ayarları
+  useEffect(() => {
+    const ctx = ctxRef.current;
+    if (!ctx) return;
+    ctx.lineWidth = Number(brushSize) || 1;
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.globalCompositeOperation =
+      tool === "eraser" ? "destination-out" : "source-over";
   }, [color, brushSize, tool]);
 
-  const startDrawing = ({ nativeEvent }) => {
-    const { offsetX, offsetY } = nativeEvent;
+  // Kısayollar: Undo / Redo / Esc (şekil iptal)
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      const mod = e.ctrlKey || e.metaKey;
+      const k = e.key.toLowerCase();
+      if (mod && k === "z") {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+      } else if (mod && k === "y") {
+        e.preventDefault();
+        redo();
+      } else if (k === "escape") {
+        if (isDrawing) {
+          setIsDrawing(false);
+          redrawAll();
+        }
+        setShape(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isDrawing]);
 
-    if (shape) {
-      setStartX(offsetX); // Set initial starting position for shape
-      setStartY(offsetY);
-      setIsDrawing(true);
-    } else {
-      contextRef.current.beginPath();
-      contextRef.current.moveTo(offsetX, offsetY);
-      setCurrentBrushStroke([{ x: offsetX, y: offsetY }]); // Track brush start position
-      setIsDrawing(true);
-    }
+  // === Yardımcılar ===
+  const clearAll = () => {
+    const canvas = canvasRef.current;
+    const ctx = ctxRef.current;
+    if (!canvas || !ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
   };
 
-  const finishDrawing = ({ nativeEvent }) => {
-    if (shape) {
-      const { offsetX, offsetY } = nativeEvent;
-      const width = offsetX - startX;
-      const height = offsetY - startY;
-      
-      // Add shape to the shapes array (history) with its fill status
-      setShapes([...shapes, { type: 'shape', shape, x: startX, y: startY, width, height, fill, color }]);
+  const drawPath = (path, strokeColor, width, composite = "source-over") => {
+    const ctx = ctxRef.current;
+    if (!ctx || path.length === 0) return;
+    const prevC = ctx.globalCompositeOperation;
+    const prevW = ctx.lineWidth;
+    const prevS = ctx.strokeStyle;
 
-      setIsDrawing(false);
-      setShape(null); // Reset shape after drawing
-    } else {
-      // Add completed brush stroke to the shapes array
-      setShapes([...shapes, { type: 'brush', points: currentBrushStroke, color, brushSize }]);
+    ctx.globalCompositeOperation = composite;
+    ctx.lineWidth = width;
+    ctx.strokeStyle = strokeColor;
 
-      contextRef.current.closePath();
-      setIsDrawing(false);
-    }
+    ctx.beginPath();
+    path.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+    ctx.stroke();
+
+    ctx.globalCompositeOperation = prevC;
+    ctx.lineWidth = prevW;
+    ctx.strokeStyle = prevS;
   };
 
-  const draw = ({ nativeEvent }) => {
+  const drawShape = (x, y, w, h, type, hexColor, doFill, width = brushSize) => {
+    const ctx = ctxRef.current;
+    if (!ctx) return;
+
+    const ps = ctx.strokeStyle, pf = ctx.fillStyle, pw = ctx.lineWidth, pc = ctx.globalCompositeOperation;
+    ctx.globalCompositeOperation = "source-over";
+    ctx.strokeStyle = hexColor;
+    ctx.fillStyle = hexColor;
+    ctx.lineWidth = width;
+
+    ctx.beginPath();
+    if (type === "rectangle") {
+      doFill ? ctx.fillRect(x, y, w, h) : ctx.strokeRect(x, y, w, h);
+    } else if (type === "circle") {
+      ctx.ellipse(x + w / 2, y + h / 2, Math.abs(w) / 2, Math.abs(h) / 2, 0, 0, Math.PI * 2);
+      doFill ? ctx.fill() : ctx.stroke();
+    } else if (type === "triangle") {
+      const x1 = x + w / 2, y1 = y;
+      const x2 = x + w, y2 = y + h;
+      const x3 = x, y3 = y + h;
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.lineTo(x3, y3);
+      ctx.closePath();
+      doFill ? ctx.fill() : ctx.stroke();
+    }
+
+    ctx.strokeStyle = ps; ctx.fillStyle = pf; ctx.lineWidth = pw; ctx.globalCompositeOperation = pc;
+  };
+
+  const redrawAll = (src = itemsRef.current) => {
+    clearAll();
+    src.forEach((it) => {
+      if (it.type === "path") {
+        drawPath(it.points, it.color, it.width, it.composite);
+      } else if (it.type === "shape") {
+        drawShape(it.x, it.y, it.w, it.h, it.shape, it.color, it.fill, it.width);
+      }
+    });
+  };
+
+  const getPos = (e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    const cx = (e.clientX ?? e.touches?.[0]?.clientX) - rect.left;
+    const cy = (e.clientY ?? e.touches?.[0]?.clientY) - rect.top;
+    return { x: cx, y: cy };
+  };
+
+  const addItem = (item) => {
+    const next = [...itemsRef.current, item];
+    setItems(next);
+    setRedoStack([]); // yeni hamlede redo temizlenir
+    redrawAll(next);
+  };
+
+  // === Pointer olayları ===
+  const onPointerDown = (e) => {
+    e.preventDefault();
+    const pos = getPos(e);
+    if (shape) {
+      startRef.current = pos;
+      setIsDrawing(true);
+      return;
+    }
+    setIsDrawing(true);
+    setCurrentPath([{ x: pos.x, y: pos.y }]);
+    const ctx = ctxRef.current;
+    if (ctx) { ctx.beginPath(); ctx.moveTo(pos.x, pos.y); }
+  };
+
+  const onPointerMove = (e) => {
+    if (!isDrawing) return;
+    const pos = getPos(e);
+
+    if (shape) {
+      const { x, y } = startRef.current;
+      const w = pos.x - x, h = pos.y - y;
+      redrawAll(); // geçmişi çiz
+      drawShape(x, y, w, h, shape, color, fill, Number(brushSize) || 1); // canlı önizleme
+      return;
+    }
+
+    setCurrentPath((prev) => {
+      const next = [...prev, { x: pos.x, y: pos.y }];
+      const ctx = ctxRef.current;
+      if (ctx) { ctx.lineTo(pos.x, pos.y); ctx.stroke(); }
+      return next;
+    });
+  };
+
+  const onPointerUp = (e) => {
     if (!isDrawing) return;
 
-    const { offsetX, offsetY } = nativeEvent;
-
     if (shape) {
-      const width = offsetX - startX; // Calculate width from drag
-      const height = offsetY - startY; // Calculate height from drag
+      const end = getPos(e);
+      const { x, y } = startRef.current;
+      const w = end.x - x, h = end.y - y;
 
-      // Clear only the part of the canvas where the current shape is being drawn
-      contextRef.current.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-      redrawCanvas(); // Redraw the previously drawn shapes and brush strokes
-
-      drawShape(startX, startY, width, height); // Draw shape based on drag size
-    } else {
-      // Add point to the current brush stroke
-      setCurrentBrushStroke([...currentBrushStroke, { x: offsetX, y: offsetY }]);
-
-      contextRef.current.lineTo(offsetX, offsetY);
-      contextRef.current.stroke();
-    }
-  };
-
-  const drawShape = (x, y, width, height, shapeType = shape, fillColor = color, shapeFill = fill) => {
-    const context = contextRef.current;
-
-    context.beginPath();
-
-    if (shapeType === 'rectangle') {
-      context.rect(x, y, width, height); // Draw rectangle based on drag size
-    } else if (shapeType === 'circle') {
-      const radius = Math.sqrt(width ** 2 + height ** 2) / 2; // Calculate radius from diagonal drag
-      context.arc(x, y, radius, 0, 2 * Math.PI); // Draw circle with calculated radius
-    } else if (shapeType === 'triangle') {
-      context.moveTo(x, y); // Top point
-      context.lineTo(x + width / 2, y + height); // Bottom right
-      context.lineTo(x - width / 2, y + height); // Bottom left
-      context.closePath();
-    }
-
-    if (shapeFill) {
-      context.fillStyle = fillColor;
-      context.fill();
-    } else {
-      context.strokeStyle = fillColor;
-      context.stroke();
-    }
-  };
-
-  const redrawCanvas = () => {
-    // Loop through the shapes array and redraw each shape/brush stroke
-    shapes.forEach(({ type, shape, x, y, width, height, fill, color, brushSize, points }) => {
-      if (type === 'shape') {
-        drawShape(x, y, width, height, shape, color, fill);
-      } else if (type === 'brush') {
-        redrawBrush(points, color, brushSize);
-      }
-    });
-  };
-
-  const redrawBrush = (points, color, brushSize) => {
-    const context = contextRef.current;
-    context.strokeStyle = color;
-    context.lineWidth = brushSize;
-
-    context.beginPath();
-    points.forEach((point, index) => {
-      const { x, y } = point;
-      if (index === 0) {
-        context.moveTo(x, y);
+      if (Math.abs(w) > 0.5 || Math.abs(h) > 0.5) {
+        addItem({
+          type: "shape",
+          shape,
+          x, y, w, h,
+          color,
+          fill,
+          width: Number(brushSize) || 1,
+        });
       } else {
-        context.lineTo(x, y);
+        redrawAll(); // minik sürükleme: sadece önizlemeyi sil
       }
+
+      setIsDrawing(false);
+      // şekil seçimi sende kalır; iptal etmedikçe arka arkaya çizebilirsin
+      return;
+    }
+
+    addItem({
+      type: "path",
+      points: currentPathRef.current,
+      color,
+      width: Number(brushSize) || 1,
+      composite: tool === "eraser" ? "destination-out" : "source-over",
     });
-    context.stroke();
+    setIsDrawing(false);
+    setCurrentPath([]);
   };
 
-  const handleColorChange = (color) => {
-    setColor(color.hex);
+  // Undo / Redo
+  const undo = () => {
+    if (isDrawing) return;
+    const cur = itemsRef.current;
+    if (cur.length === 0) return;
+    const next = cur.slice(0, -1);
+    const popped = cur[cur.length - 1];
+    setItems(next);
+    setRedoStack((r) => [...r, popped]);
+    redrawAll(next);
   };
+
+  const redo = () => {
+    if (isDrawing) return;
+    const r = redoRef.current;
+    if (r.length === 0) return;
+    const nextRedo = r.slice(0, -1);
+    const item = r[r.length - 1];
+    setRedoStack(nextRedo);
+    const merged = [...itemsRef.current, item];
+    setItems(merged);
+    redrawAll(merged);
+  };
+
+  // Handlers
+  const handleColorChange = (c) => setColor(c.hex);
+  const handleBrushSize = (e) => setBrushSize(parseInt(e.target.value, 10));
 
   const clearCanvas = () => {
-    const canvas = canvasRef.current;
-    const context = contextRef.current;
-    context.clearRect(0, 0, canvas.width, canvas.height);
-    setShapes([]); // Clear the shape history
+    clearAll();
+    setItems([]);
+    setRedoStack([]);
+    const ctx = ctxRef.current;
+    if (ctx) ctx.globalCompositeOperation = "source-over";
   };
 
   const saveAsImage = () => {
     const canvas = canvasRef.current;
-    const link = document.createElement('a');
-    link.href = canvas.toDataURL();
-    link.download = 'sketch.png';
-    link.click();
+    const a = document.createElement("a");
+    a.href = canvas.toDataURL("image/png");
+    a.download = "sketch.png";
+    a.click();
   };
 
-  const handleShapeClick = (shape) => {
-    setShape(shape); // Set the selected shape
+  // toggle shape (aynı butona basınca kapat)
+  const toggleShape = (s) => {
+    setShape((prev) => {
+      const next = prev === s ? null : s;
+      if (next) setTool("brush"); // şekiller fırça ayarını kullanır
+      return next;
+    });
   };
 
   return (
-    <div className="app">
-      <div className="sidebar">
+    <div className="sp-app" onContextMenu={(e) => e.preventDefault()}>
+      <div className="sp-sidebar">
+        <h3>History</h3>
+        <div className="sp-icon-row">
+          <button
+            type="button"
+            className="sp-icon-btn"
+            onClick={undo}
+            disabled={items.length === 0}
+            title="Undo (Ctrl/Cmd+Z)"
+            aria-label="Undo"
+          >
+            <img src={undoIcon} alt="" />
+          </button>
+          <button
+            type="button"
+            className="sp-icon-btn"
+            onClick={redo}
+            disabled={redoStack.length === 0}
+            title="Redo (Ctrl/Cmd+Y)"
+            aria-label="Redo"
+          >
+            <img src={redoIcon} alt="" />
+          </button>
+        </div>
+
         <h3>Shapes</h3>
-        <div>
-          <input type="radio" id="rectangle" name="shape" onClick={() => handleShapeClick('rectangle')} />
-          <label htmlFor="rectangle">Rectangle</label>
+        <div className="sp-control">
+          <input type="radio" id="sp-rectangle" name="sp-shape"
+                 checked={shape === "rectangle"} onClick={() => toggleShape("rectangle")} readOnly />
+          <label htmlFor="sp-rectangle">Rectangle</label>
         </div>
-        <div>
-          <input type="radio" id="circle" name="shape" onClick={() => handleShapeClick('circle')} />
-          <label htmlFor="circle">Circle</label>
+        <div className="sp-control">
+          <input type="radio" id="sp-circle" name="sp-shape"
+                 checked={shape === "circle"} onClick={() => toggleShape("circle")} readOnly />
+          <label htmlFor="sp-circle">Circle</label>
         </div>
-        <div>
-          <input type="radio" id="triangle" name="shape" onClick={() => handleShapeClick('triangle')} />
-          <label htmlFor="triangle">Triangle</label>
+        <div className="sp-control">
+          <input type="radio" id="sp-triangle" name="sp-shape"
+                 checked={shape === "triangle"} onClick={() => toggleShape("triangle")} readOnly />
+          <label htmlFor="sp-triangle">Triangle</label>
         </div>
-        <div>
-          <input type="checkbox" id="fill" onChange={() => setFill(!fill)} />
-          <label htmlFor="fill">Fill color</label>
+        <div className="sp-control">
+          <input type="checkbox" id="sp-fill"
+                 checked={fill} onChange={() => setFill((f) => !f)} />
+          <label htmlFor="sp-fill">Fill color</label>
         </div>
+        <button
+          type="button"
+          onClick={() => { setShape(null); setIsDrawing(false); redrawAll(); }}
+          style={{ marginTop: 6, background: "#6b7280" }}
+        >
+          Cancel shape (Esc)
+        </button>
 
         <h3>Options</h3>
-        <div>
-          <input type="radio" id="brush" name="tool" onClick={() => setTool('brush')} />
-          <label htmlFor="brush">Brush</label>
+        <div className="sp-control">
+          <input type="radio" id="sp-brush" name="sp-tool"
+                 checked={tool === "brush"} onChange={() => setTool("brush")} />
+          <label htmlFor="sp-brush">Brush</label>
         </div>
-        <div>
-          <input type="radio" id="eraser" name="tool" onClick={() => setTool('eraser')} />
-          <label htmlFor="eraser">Eraser</label>
+        <div className="sp-control">
+          <input type="radio" id="sp-eraser" name="sp-tool"
+                 checked={tool === "eraser"} onChange={() => setTool("eraser")} />
+          <label htmlFor="sp-eraser">Eraser</label>
         </div>
 
-        <input
-          type="range"
-          min="1"
-          max="20"
-          value={brushSize}
-          onChange={(e) => setBrushSize(e.target.value)}
-        />
+        <div className="sp-control">
+          <label htmlFor="sp-size">Brush size: {brushSize}px</label>
+          <input id="sp-size" type="range" min="1" max="40"
+                 value={brushSize} onChange={handleBrushSize} />
+        </div>
 
         <button onClick={clearCanvas}>Clear Canvas</button>
         <button onClick={saveAsImage}>Save As Image</button>
 
-        <div className="color-picker">
+        <div className="sp-color-picker">
           <h3>Colors</h3>
-          <SketchPicker color={color} onChange={handleColorChange} />
+          <SketchPicker color={color} onChange={handleColorChange} disableAlpha />
         </div>
+
+        
       </div>
 
       <canvas
-        onMouseDown={startDrawing}
-        onMouseUp={finishDrawing}
-        onMouseMove={draw}
         ref={canvasRef}
-        style={{ border: '2px solid black' }}
+        className="sp-canvas"
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerLeave={onPointerUp}
       />
     </div>
   );
